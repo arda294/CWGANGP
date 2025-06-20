@@ -1,0 +1,10 @@
+joblib==1.4.2
+matplotlib==3.8.4
+numpy==1.24.3
+pandas==2.3.0
+rdt==1.13.1
+safetensors==0.5.3
+scikit_learn==1.7.0
+scipy==1.15.3
+torch==2.3.0
+tqdm==4.66.4
