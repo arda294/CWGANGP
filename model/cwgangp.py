@@ -15,7 +15,7 @@ class CWGANGPGenerator(nn.Module):
         self.input_dim = input_dim
         self.data_column_infos = data_column_infos
         self.hidden_dim = hidden_dim
-        self.device = torch.device(device if torch.cuda.is_available() and device != None else "cpu")
+        self.device = torch.device(device if (torch.cuda.is_available() or torch.backends.mps.is_available()) and device != None else "cpu")
         self.discrete_cols: list[DataColumnInfo] = [col_info for _, col_info in self.data_column_infos.items() if col_info.is_discrete == True]
         self.numerical_cols: list[DataColumnInfo] = [col_info for _, col_info in self.data_column_infos.items() if col_info.is_discrete == False]
         self.debug = False
@@ -65,7 +65,7 @@ class CWGANGPGenerator(nn.Module):
             self.fc_cond.append(nn.Linear(self.input_dim + self.cond_dim + 2*self.hidden_dim, len(discrete_col.category_counts)))
         
         print(f"using {self.device}")
-        self.to(self.device)
+        self.to(device=self.device)
 
     def forward(self, z: torch.Tensor, cond: torch.Tensor):
         h0 = torch.cat((z, cond), dim=1)
@@ -79,7 +79,11 @@ class CWGANGPGenerator(nn.Module):
         numerical_outputs = []
         for fc_normalized, fc_component in zip(self.fc_numeric_normalized, self.fc_numeric_component):
             a_i = fc_normalized(h2)
-            b_i = F.gumbel_softmax(fc_component(h2), tau=0.2, hard=False)
+            h_num = fc_component(h2)
+            if "mps" in h_num.device.type:
+                b_i = self.mps_gumbel_softmax(h_num, tau=0.2, hard=False)
+            else:
+                b_i = F.gumbel_softmax(h_num, tau=0.2, hard=False)
             numerical_outputs.append(a_i)
             numerical_outputs.append(b_i)
         
@@ -87,7 +91,11 @@ class CWGANGPGenerator(nn.Module):
 
         discrete_outputs = []
         for fc_discrete in self.fc_cond:
-            d_i = F.gumbel_softmax(fc_discrete(h2), tau=0.2, hard=False)
+            h_disc = fc_discrete(h2)
+            if "mps" in h_disc.device.type:
+                d_i = self.mps_gumbel_softmax(h_disc, tau=0.2, hard=False)
+            else:
+                d_i = F.gumbel_softmax(h_disc, tau=0.2, hard=False)
             discrete_outputs.append(d_i)
 
         discrete_outputs = torch.cat(discrete_outputs, dim=1)
@@ -95,12 +103,39 @@ class CWGANGPGenerator(nn.Module):
         output = torch.cat((numerical_outputs, discrete_outputs), dim=1)
         return output
     
+    def mps_gumbel_softmax(self, logits, tau=1.0, hard=False):
+        # Clamp input logits more aggressively on MPS
+        logits = torch.clamp(logits, min=-15, max=15)
+        
+        # Generate Gumbel noise more safely
+        uniform = torch.rand_like(logits)
+        # Clamp uniform to avoid log(0) or log of very small numbers
+        uniform = torch.clamp(uniform, min=1e-7, max=1-1e-7)
+        
+        gumbel = -torch.log(-torch.log(uniform))
+        # Clamp Gumbel noise
+        gumbel = torch.clamp(gumbel, min=-20, max=20)
+        
+        # Apply temperature and compute softmax
+        y = (logits + gumbel) / tau
+        y_soft = F.softmax(y, dim=-1)
+        
+        if hard:
+            # Straight-through estimator
+            index = y_soft.max(dim=-1, keepdim=True)[1]
+            y_hard = torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(-1, index, 1.0)
+            ret = y_hard - y_soft.detach() + y_soft
+        else:
+            ret = y_soft
+        
+        return ret
+    
 class CWGANGPCritic(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 256, device=None):
         super(CWGANGPCritic, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.device = torch.device(device if torch.cuda.is_available() and device != None else "cpu")
+        self.device = torch.device(device if (torch.cuda.is_available() or torch.backends.mps.is_available()) and device != None else "cpu")
 
         self.fc1 = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
@@ -162,7 +197,7 @@ class CWGANGP():
         self._transformer_fit_n_jobs = transformer_fit_n_jobs
         self._transformer_transform_n_jobs = transformer_transform_n_jobs
 
-        self._device = torch.device(device if torch.cuda.is_available() and device != None else "cpu")
+        self._device = torch.device(device if (torch.cuda.is_available() or torch.backends.mps.is_available()) and device != None else "cpu")
 
         self._generator = None
         self._critic = None
@@ -277,9 +312,9 @@ class CWGANGP():
                     z = torch.randn(self._batch_size, self._generator_input_dim, device=self._device)
 
                     cond_vector = torch.from_numpy(cond_vector).to(device=self._device)
+                    real_datas = self._dataset[batch_indices].to(device=self._device)
 
                     fake_datas = self._generator(z, cond_vector)
-                    real_datas = self._dataset[batch_indices].to(device=self._device)
 
                     y_fake = self._critic(fake_datas, cond_vector)
                     y_real = self._critic(real_datas, cond_vector)
@@ -377,7 +412,7 @@ class CWGANGP():
         state_dict = {}
         metadata = None
 
-        use_device = torch.device(device if torch.cuda.is_available() and device != None else "cpu")
+        use_device = torch.device(device if (torch.cuda.is_available() or torch.backends.mps.is_available()) and device != None else "cpu")
 
         with safe_open(filename=path, framework="pt") as f:
             for key in f.keys():
